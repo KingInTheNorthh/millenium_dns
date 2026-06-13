@@ -133,8 +133,16 @@ pub enum QueryType {
     A,
     NS,
     CNAME,
+    SOA,
     MX,
+    TXT,
     AAAA,
+    DS,
+    RRSIG,
+    NSEC,
+    DNSKEY,
+    NSEC3,
+    OPT,
 }
 
 impl QueryType {
@@ -144,8 +152,16 @@ impl QueryType {
             Self::A => 1,
             Self::NS => 2,
             Self::CNAME => 5,
+            Self::SOA => 6,
             Self::MX => 15,
+            Self::TXT => 16,
             Self::AAAA => 28,
+            Self::DS => 43,
+            Self::RRSIG => 46,
+            Self::NSEC => 47,
+            Self::DNSKEY => 48,
+            Self::NSEC3 => 50,
+            Self::OPT => 41,
         }
     }
 
@@ -154,8 +170,16 @@ impl QueryType {
             1 => Self::A,
             2 => Self::NS,
             5 => Self::CNAME,
+            6 => Self::SOA,
             15 => Self::MX,
+            16 => Self::TXT,
             28 => Self::AAAA,
+            43 => Self::DS,
+            46 => Self::RRSIG,
+            47 => Self::NSEC,
+            48 => Self::DNSKEY,
+            50 => Self::NSEC3,
+            41 => Self::OPT,
             _ => Self::Unknown(num),
         }
     }
@@ -165,11 +189,18 @@ impl QueryType {
             "A" => Ok(Self::A),
             "NS" => Ok(Self::NS),
             "CNAME" => Ok(Self::CNAME),
+            "SOA" => Ok(Self::SOA),
             "MX" => Ok(Self::MX),
+            "TXT" => Ok(Self::TXT),
             "AAAA" => Ok(Self::AAAA),
+            "DS" => Ok(Self::DS),
+            "RRSIG" => Ok(Self::RRSIG),
+            "NSEC" => Ok(Self::NSEC),
+            "DNSKEY" => Ok(Self::DNSKEY),
+            "NSEC3" => Ok(Self::NSEC3),
             other => {
                 let value = other.parse::<u16>()?;
-                Ok(Self::Unknown(value))
+                Ok(Self::from_num(value))
             }
         }
     }
@@ -224,16 +255,86 @@ pub enum DnsRecord {
         host: String,
         ttl: u32,
     },
+    SOA {
+        domain: String,
+        mname: String,
+        rname: String,
+        serial: u32,
+        refresh: u32,
+        retry: u32,
+        expire: u32,
+        minimum: u32,
+        ttl: u32,
+    },
     MX {
         domain: String,
         priority: u16,
         host: String,
         ttl: u32,
     },
+    TXT {
+        domain: String,
+        text: String,
+        ttl: u32,
+    },
     AAAA {
         domain: String,
         addr: Ipv6Addr,
         ttl: u32,
+    },
+    /// Delegation Signer: links a child zone's DNSKEY to the parent. (type 43)
+    DS {
+        domain: String,
+        key_tag: u16,
+        algorithm: u8,
+        digest_type: u8,
+        digest: Vec<u8>,
+        ttl: u32,
+    },
+    /// Signature over an RRset. (type 46)
+    RRSIG {
+        domain: String,
+        type_covered: u16,
+        algorithm: u8,
+        labels: u8,
+        original_ttl: u32,
+        expiration: u32,
+        inception: u32,
+        key_tag: u16,
+        signer_name: String,
+        signature: Vec<u8>,
+        ttl: u32,
+    },
+    /// Authenticated denial of existence. (type 47)
+    NSEC {
+        domain: String,
+        next_domain: String,
+        type_bitmaps: Vec<u8>,
+        ttl: u32,
+    },
+    /// A public key used to verify RRSIGs in a zone. (type 48)
+    DNSKEY {
+        domain: String,
+        flags: u16,
+        protocol: u8,
+        algorithm: u8,
+        public_key: Vec<u8>,
+        ttl: u32,
+    },
+    /// Hashed authenticated denial of existence. Carried verbatim. (type 50)
+    NSEC3 {
+        domain: String,
+        rdata: Vec<u8>,
+        ttl: u32,
+    },
+    /// EDNS(0) pseudo-record carrying the advertised UDP payload size and the
+    /// DNSSEC OK (DO) flag. Lives only in the additional section. (type 41)
+    OPT {
+        udp_payload_size: u16,
+        extended_rcode: u8,
+        version: u8,
+        dnssec_ok: bool,
+        data: Vec<u8>,
     },
 }
 
@@ -244,7 +345,7 @@ impl DnsRecord {
 
         let qtype_num = buffer.read_u16()?;
         let qtype = QueryType::from_num(qtype_num);
-        let _class = buffer.read_u16()?;
+        let class = buffer.read_u16()?;
         let ttl = buffer.read_u32()?;
         let data_len = buffer.read_u16()?;
 
@@ -288,6 +389,28 @@ impl DnsRecord {
                 buffer.read_qname(&mut host)?;
                 Ok(Self::CNAME { domain, host, ttl })
             }
+            QueryType::SOA => {
+                let mut mname = String::new();
+                buffer.read_qname(&mut mname)?;
+                let mut rname = String::new();
+                buffer.read_qname(&mut rname)?;
+                let serial = buffer.read_u32()?;
+                let refresh = buffer.read_u32()?;
+                let retry = buffer.read_u32()?;
+                let expire = buffer.read_u32()?;
+                let minimum = buffer.read_u32()?;
+                Ok(Self::SOA {
+                    domain,
+                    mname,
+                    rname,
+                    serial,
+                    refresh,
+                    retry,
+                    expire,
+                    minimum,
+                    ttl,
+                })
+            }
             QueryType::MX => {
                 let priority = buffer.read_u16()?;
                 let mut host = String::new();
@@ -297,6 +420,106 @@ impl DnsRecord {
                     priority,
                     host,
                     ttl,
+                })
+            }
+            QueryType::TXT => {
+                // TXT rdata is one or more <length, bytes> character-strings.
+                // We concatenate them into a single string for convenience.
+                let end = buffer.pos() + data_len as usize;
+                let mut text = String::new();
+                while buffer.pos() < end {
+                    let len = buffer.read()? as usize;
+                    let chunk = buffer.read_bytes(len)?;
+                    text.push_str(&String::from_utf8_lossy(&chunk));
+                }
+                Ok(Self::TXT { domain, text, ttl })
+            }
+            QueryType::DS => {
+                let key_tag = buffer.read_u16()?;
+                let algorithm = buffer.read()?;
+                let digest_type = buffer.read()?;
+                let digest = buffer.read_bytes(data_len as usize - 4)?;
+                Ok(Self::DS {
+                    domain,
+                    key_tag,
+                    algorithm,
+                    digest_type,
+                    digest,
+                    ttl,
+                })
+            }
+            QueryType::RRSIG => {
+                let rdata_start = buffer.pos();
+                let type_covered = buffer.read_u16()?;
+                let algorithm = buffer.read()?;
+                let labels = buffer.read()?;
+                let original_ttl = buffer.read_u32()?;
+                let expiration = buffer.read_u32()?;
+                let inception = buffer.read_u32()?;
+                let key_tag = buffer.read_u16()?;
+
+                let mut signer_name = String::new();
+                buffer.read_qname(&mut signer_name)?;
+
+                let consumed = buffer.pos() - rdata_start;
+                let signature = buffer.read_bytes(data_len as usize - consumed)?;
+
+                Ok(Self::RRSIG {
+                    domain,
+                    type_covered,
+                    algorithm,
+                    labels,
+                    original_ttl,
+                    expiration,
+                    inception,
+                    key_tag,
+                    signer_name,
+                    signature,
+                    ttl,
+                })
+            }
+            QueryType::NSEC => {
+                let rdata_start = buffer.pos();
+                let mut next_domain = String::new();
+                buffer.read_qname(&mut next_domain)?;
+                let consumed = buffer.pos() - rdata_start;
+                let type_bitmaps = buffer.read_bytes(data_len as usize - consumed)?;
+                Ok(Self::NSEC {
+                    domain,
+                    next_domain,
+                    type_bitmaps,
+                    ttl,
+                })
+            }
+            QueryType::DNSKEY => {
+                let flags = buffer.read_u16()?;
+                let protocol = buffer.read()?;
+                let algorithm = buffer.read()?;
+                let public_key = buffer.read_bytes(data_len as usize - 4)?;
+                Ok(Self::DNSKEY {
+                    domain,
+                    flags,
+                    protocol,
+                    algorithm,
+                    public_key,
+                    ttl,
+                })
+            }
+            QueryType::NSEC3 => {
+                let rdata = buffer.read_bytes(data_len as usize)?;
+                Ok(Self::NSEC3 { domain, rdata, ttl })
+            }
+            QueryType::OPT => {
+                // For OPT the "class" field is the advertised UDP payload size
+                // and the "ttl" field packs the extended rcode, version, and
+                // flags (the top bit being DNSSEC OK).
+                let data = buffer.read_bytes(data_len as usize)?;
+                Ok(Self::OPT {
+                    udp_payload_size: class,
+                    extended_rcode: (ttl >> 24) as u8,
+                    version: (ttl >> 16) as u8,
+                    dnssec_ok: (ttl & 0x0000_8000) != 0,
+                    data,
                 })
             }
             QueryType::Unknown(_) => {
@@ -332,6 +555,35 @@ impl DnsRecord {
             Self::CNAME { domain, host, ttl } => {
                 write_name_record(buffer, domain, QueryType::CNAME, *ttl, host)?;
             }
+            Self::SOA {
+                domain,
+                mname,
+                rname,
+                serial,
+                refresh,
+                retry,
+                expire,
+                minimum,
+                ttl,
+            } => {
+                buffer.write_qname(domain)?;
+                buffer.write_u16(QueryType::SOA.to_num())?;
+                buffer.write_u16(1)?;
+                buffer.write_u32(*ttl)?;
+
+                let data_len_pos = buffer.pos();
+                buffer.write_u16(0)?;
+                buffer.write_qname(mname)?;
+                buffer.write_qname(rname)?;
+                buffer.write_u32(*serial)?;
+                buffer.write_u32(*refresh)?;
+                buffer.write_u32(*retry)?;
+                buffer.write_u32(*expire)?;
+                buffer.write_u32(*minimum)?;
+
+                let size = buffer.pos() - (data_len_pos + 2);
+                buffer.set_u16(data_len_pos, size as u16)?;
+            }
             Self::MX {
                 domain,
                 priority,
@@ -351,6 +603,23 @@ impl DnsRecord {
                 let size = buffer.pos() - (data_len_pos + 2);
                 buffer.set_u16(data_len_pos, size as u16)?;
             }
+            Self::TXT { domain, text, ttl } => {
+                buffer.write_qname(domain)?;
+                buffer.write_u16(QueryType::TXT.to_num())?;
+                buffer.write_u16(1)?;
+                buffer.write_u32(*ttl)?;
+
+                let data_len_pos = buffer.pos();
+                buffer.write_u16(0)?;
+                // Emit as 255-byte character-strings, as the wire format requires.
+                for chunk in text.as_bytes().chunks(255) {
+                    buffer.write_u8(chunk.len() as u8)?;
+                    buffer.write_bytes(chunk)?;
+                }
+
+                let size = buffer.pos() - (data_len_pos + 2);
+                buffer.set_u16(data_len_pos, size as u16)?;
+            }
             Self::AAAA { domain, addr, ttl } => {
                 buffer.write_qname(domain)?;
                 buffer.write_u16(QueryType::AAAA.to_num())?;
@@ -361,6 +630,120 @@ impl DnsRecord {
                 for segment in addr.segments() {
                     buffer.write_u16(segment)?;
                 }
+            }
+            Self::DS {
+                domain,
+                key_tag,
+                algorithm,
+                digest_type,
+                digest,
+                ttl,
+            } => {
+                buffer.write_qname(domain)?;
+                buffer.write_u16(QueryType::DS.to_num())?;
+                buffer.write_u16(1)?;
+                buffer.write_u32(*ttl)?;
+                buffer.write_u16((4 + digest.len()) as u16)?;
+                buffer.write_u16(*key_tag)?;
+                buffer.write_u8(*algorithm)?;
+                buffer.write_u8(*digest_type)?;
+                buffer.write_bytes(digest)?;
+            }
+            Self::RRSIG {
+                domain,
+                type_covered,
+                algorithm,
+                labels,
+                original_ttl,
+                expiration,
+                inception,
+                key_tag,
+                signer_name,
+                signature,
+                ttl,
+            } => {
+                buffer.write_qname(domain)?;
+                buffer.write_u16(QueryType::RRSIG.to_num())?;
+                buffer.write_u16(1)?;
+                buffer.write_u32(*ttl)?;
+
+                let data_len_pos = buffer.pos();
+                buffer.write_u16(0)?;
+                buffer.write_u16(*type_covered)?;
+                buffer.write_u8(*algorithm)?;
+                buffer.write_u8(*labels)?;
+                buffer.write_u32(*original_ttl)?;
+                buffer.write_u32(*expiration)?;
+                buffer.write_u32(*inception)?;
+                buffer.write_u16(*key_tag)?;
+                buffer.write_qname(signer_name)?;
+                buffer.write_bytes(signature)?;
+
+                let size = buffer.pos() - (data_len_pos + 2);
+                buffer.set_u16(data_len_pos, size as u16)?;
+            }
+            Self::NSEC {
+                domain,
+                next_domain,
+                type_bitmaps,
+                ttl,
+            } => {
+                buffer.write_qname(domain)?;
+                buffer.write_u16(QueryType::NSEC.to_num())?;
+                buffer.write_u16(1)?;
+                buffer.write_u32(*ttl)?;
+
+                let data_len_pos = buffer.pos();
+                buffer.write_u16(0)?;
+                buffer.write_qname(next_domain)?;
+                buffer.write_bytes(type_bitmaps)?;
+
+                let size = buffer.pos() - (data_len_pos + 2);
+                buffer.set_u16(data_len_pos, size as u16)?;
+            }
+            Self::DNSKEY {
+                domain,
+                flags,
+                protocol,
+                algorithm,
+                public_key,
+                ttl,
+            } => {
+                buffer.write_qname(domain)?;
+                buffer.write_u16(QueryType::DNSKEY.to_num())?;
+                buffer.write_u16(1)?;
+                buffer.write_u32(*ttl)?;
+                buffer.write_u16((4 + public_key.len()) as u16)?;
+                buffer.write_u16(*flags)?;
+                buffer.write_u8(*protocol)?;
+                buffer.write_u8(*algorithm)?;
+                buffer.write_bytes(public_key)?;
+            }
+            Self::NSEC3 { domain, rdata, ttl } => {
+                buffer.write_qname(domain)?;
+                buffer.write_u16(QueryType::NSEC3.to_num())?;
+                buffer.write_u16(1)?;
+                buffer.write_u32(*ttl)?;
+                buffer.write_u16(rdata.len() as u16)?;
+                buffer.write_bytes(rdata)?;
+            }
+            Self::OPT {
+                udp_payload_size,
+                extended_rcode,
+                version,
+                dnssec_ok,
+                data,
+            } => {
+                // Root name, then type, then the repurposed class/ttl fields.
+                buffer.write_u8(0)?;
+                buffer.write_u16(QueryType::OPT.to_num())?;
+                buffer.write_u16(*udp_payload_size)?;
+                let ttl = ((*extended_rcode as u32) << 24)
+                    | ((*version as u32) << 16)
+                    | (if *dnssec_ok { 0x0000_8000 } else { 0 });
+                buffer.write_u32(ttl)?;
+                buffer.write_u16(data.len() as u16)?;
+                buffer.write_bytes(data)?;
             }
             Self::Unknown { .. } => {}
         }
@@ -374,8 +757,17 @@ impl DnsRecord {
             | Self::A { ttl, .. }
             | Self::NS { ttl, .. }
             | Self::CNAME { ttl, .. }
+            | Self::SOA { ttl, .. }
             | Self::MX { ttl, .. }
-            | Self::AAAA { ttl, .. } => *ttl,
+            | Self::TXT { ttl, .. }
+            | Self::AAAA { ttl, .. }
+            | Self::DS { ttl, .. }
+            | Self::RRSIG { ttl, .. }
+            | Self::NSEC { ttl, .. }
+            | Self::DNSKEY { ttl, .. }
+            | Self::NSEC3 { ttl, .. } => *ttl,
+            // The OPT pseudo-record has no TTL of its own.
+            Self::OPT { .. } => 0,
         }
     }
 
@@ -387,11 +779,39 @@ impl DnsRecord {
             | Self::A { ttl, .. }
             | Self::NS { ttl, .. }
             | Self::CNAME { ttl, .. }
+            | Self::SOA { ttl, .. }
             | Self::MX { ttl, .. }
-            | Self::AAAA { ttl, .. } => *ttl = new_ttl,
+            | Self::TXT { ttl, .. }
+            | Self::AAAA { ttl, .. }
+            | Self::DS { ttl, .. }
+            | Self::RRSIG { ttl, .. }
+            | Self::NSEC { ttl, .. }
+            | Self::DNSKEY { ttl, .. }
+            | Self::NSEC3 { ttl, .. } => *ttl = new_ttl,
+            Self::OPT { .. } => {}
         }
 
         record
+    }
+
+    /// The owner name of this record, if it has one (everything but OPT).
+    pub fn domain(&self) -> Option<&str> {
+        match self {
+            Self::Unknown { domain, .. }
+            | Self::A { domain, .. }
+            | Self::NS { domain, .. }
+            | Self::CNAME { domain, .. }
+            | Self::SOA { domain, .. }
+            | Self::MX { domain, .. }
+            | Self::TXT { domain, .. }
+            | Self::AAAA { domain, .. }
+            | Self::DS { domain, .. }
+            | Self::RRSIG { domain, .. }
+            | Self::NSEC { domain, .. }
+            | Self::DNSKEY { domain, .. }
+            | Self::NSEC3 { domain, .. } => Some(domain),
+            Self::OPT { .. } => None,
+        }
     }
 }
 
@@ -522,6 +942,44 @@ impl DnsPacket {
     pub fn get_unresolved_ns<'a>(&'a self, qname: &'a str) -> Option<&'a str> {
         self.get_ns(qname).map(|(_, host)| host).next()
     }
+
+    /// Attach an EDNS(0) OPT record to the additional section, advertising a
+    /// larger UDP payload size and optionally setting the DNSSEC OK (DO) flag.
+    pub fn set_edns(&mut self, udp_payload_size: u16, dnssec_ok: bool) {
+        self.resources.retain(|r| !matches!(r, DnsRecord::OPT { .. }));
+        self.resources.push(DnsRecord::OPT {
+            udp_payload_size,
+            extended_rcode: 0,
+            version: 0,
+            dnssec_ok,
+            data: Vec::new(),
+        });
+    }
+
+    /// The OPT pseudo-record carried by this packet, if any.
+    pub fn edns(&self) -> Option<&DnsRecord> {
+        self.resources
+            .iter()
+            .chain(self.answers.iter())
+            .chain(self.authorities.iter())
+            .find(|r| matches!(r, DnsRecord::OPT { .. }))
+    }
+
+    /// Whether the sender set the DNSSEC OK (DO) flag.
+    pub fn dnssec_ok(&self) -> bool {
+        matches!(self.edns(), Some(DnsRecord::OPT { dnssec_ok: true, .. }))
+    }
+
+    /// The largest response the peer will accept over UDP. Falls back to the
+    /// classic 512-byte limit when no EDNS OPT record is present.
+    pub fn max_udp_payload(&self) -> usize {
+        match self.edns() {
+            Some(DnsRecord::OPT {
+                udp_payload_size, ..
+            }) => (*udp_payload_size as usize).max(crate::buffer::DNS_PACKET_SIZE),
+            _ => crate::buffer::DNS_PACKET_SIZE,
+        }
+    }
 }
 
 impl Default for DnsPacket {
@@ -581,5 +1039,80 @@ mod tests {
                 0x06, b'g', b'o', b'o', b'g', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00
             ]
         );
+    }
+
+    fn round_trip(record: DnsRecord) -> DnsRecord {
+        let mut buffer = BytePacketBuffer::new();
+        record.write(&mut buffer).unwrap();
+        buffer.seek(0).unwrap();
+        DnsRecord::read(&mut buffer).unwrap()
+    }
+
+    #[test]
+    fn soa_and_txt_round_trip() {
+        let soa = DnsRecord::SOA {
+            domain: "example.com".into(),
+            mname: "ns1.example.com".into(),
+            rname: "admin.example.com".into(),
+            serial: 2024010101,
+            refresh: 7200,
+            retry: 3600,
+            expire: 1209600,
+            minimum: 3600,
+            ttl: 3600,
+        };
+        assert_eq!(round_trip(soa.clone()), soa);
+
+        let txt = DnsRecord::TXT {
+            domain: "example.com".into(),
+            text: "v=spf1 -all".into(),
+            ttl: 300,
+        };
+        assert_eq!(round_trip(txt.clone()), txt);
+    }
+
+    #[test]
+    fn dnssec_records_round_trip() {
+        let ds = DnsRecord::DS {
+            domain: "example.com".into(),
+            key_tag: 12345,
+            algorithm: 8,
+            digest_type: 2,
+            digest: vec![0xde, 0xad, 0xbe, 0xef, 0x00, 0x11],
+            ttl: 86400,
+        };
+        assert_eq!(round_trip(ds.clone()), ds);
+
+        let rrsig = DnsRecord::RRSIG {
+            domain: "example.com".into(),
+            type_covered: 1,
+            algorithm: 8,
+            labels: 2,
+            original_ttl: 300,
+            expiration: 1700000000,
+            inception: 1690000000,
+            key_tag: 54321,
+            signer_name: "example.com".into(),
+            signature: vec![0x01, 0x02, 0x03, 0x04, 0x05],
+            ttl: 300,
+        };
+        assert_eq!(round_trip(rrsig.clone()), rrsig);
+    }
+
+    #[test]
+    fn edns_opt_round_trips_dnssec_ok() {
+        let mut packet = DnsPacket::new();
+        packet
+            .questions
+            .push(DnsQuestion::new("example.com".into(), QueryType::A));
+        packet.set_edns(4096, true);
+
+        let mut buffer = BytePacketBuffer::new();
+        packet.write(&mut buffer).unwrap();
+        buffer.seek(0).unwrap();
+
+        let parsed = DnsPacket::from_buffer(&mut buffer).unwrap();
+        assert!(parsed.dnssec_ok());
+        assert_eq!(parsed.max_udp_payload(), 4096);
     }
 }

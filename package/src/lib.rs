@@ -1,6 +1,9 @@
 pub mod buffer;
 pub mod cache;
+pub mod dnssec;
 pub mod error;
 pub mod protocol;
 pub mod resolver;
 pub mod server;
+pub mod verify;
+pub mod zone;

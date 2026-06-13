@@ -45,9 +45,7 @@ impl ResponseCache {
         let key = CacheKey::from_question(question);
         let now = Instant::now();
 
-        let Some(entry) = self.entries.get(&key) else {
-            return None;
-        };
+        let entry = self.entries.get(&key)?;
 
         let answers = live_records(&entry.answers, now);
 

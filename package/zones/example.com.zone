@@ -1,0 +1,24 @@
+; Sample authoritative zone for millenium-dns.
+;   millenium-dns serve 127.0.0.1:2053 zones/example.com.zone
+$ORIGIN example.com.
+$TTL 3600
+
+@       IN SOA ns1.example.com. admin.example.com. (
+            2024010101 ; serial
+            7200       ; refresh
+            3600       ; retry
+            1209600    ; expire
+            3600 )     ; minimum
+
+@           IN NS    ns1.example.com.
+@           IN NS    ns2.example.com.
+@           IN A     93.184.216.34
+@           IN MX    10 mail.example.com.
+
+www         IN A     93.184.216.34
+www         IN AAAA  2606:2800:220:1:248:1893:25c8:1946
+mail        IN A     93.184.216.35
+ns1         IN A     93.184.216.1
+ns2         IN A     93.184.216.2
+ftp         IN CNAME www.example.com.
+@           IN TXT   "v=spf1 mx -all"

@@ -1,16 +1,22 @@
 use crate::error::{Result, dns_error};
 
+/// The classic 512-byte limit for DNS over UDP without EDNS.
 pub const DNS_PACKET_SIZE: usize = 512;
 
+/// A DNS message over TCP is length-prefixed with a `u16`, so the largest a
+/// single message can ever be is 65535 bytes. We back every buffer with this
+/// much space so the same type can carry UDP, EDNS, and TCP payloads.
+pub const MAX_PACKET_SIZE: usize = 65535;
+
 pub struct BytePacketBuffer {
-    pub buf: [u8; DNS_PACKET_SIZE],
+    pub buf: Vec<u8>,
     pub pos: usize,
 }
 
 impl BytePacketBuffer {
     pub fn new() -> Self {
         Self {
-            buf: [0; DNS_PACKET_SIZE],
+            buf: vec![0; MAX_PACKET_SIZE],
             pos: 0,
         }
     }
@@ -24,7 +30,7 @@ impl BytePacketBuffer {
     }
 
     pub fn seek(&mut self, pos: usize) -> Result<()> {
-        if pos > DNS_PACKET_SIZE {
+        if pos > self.buf.len() {
             return Err(dns_error("End of buffer"));
         }
         self.pos = pos;
@@ -32,7 +38,7 @@ impl BytePacketBuffer {
     }
 
     pub fn read(&mut self) -> Result<u8> {
-        if self.pos >= DNS_PACKET_SIZE {
+        if self.pos >= self.buf.len() {
             return Err(dns_error("End of buffer"));
         }
 
@@ -43,7 +49,7 @@ impl BytePacketBuffer {
     }
 
     pub fn get(&self, pos: usize) -> Result<u8> {
-        if pos >= DNS_PACKET_SIZE {
+        if pos >= self.buf.len() {
             return Err(dns_error("End of buffer"));
         }
 
@@ -51,11 +57,24 @@ impl BytePacketBuffer {
     }
 
     pub fn get_range(&self, start: usize, len: usize) -> Result<&[u8]> {
-        if start + len > DNS_PACKET_SIZE {
+        if start + len > self.buf.len() {
             return Err(dns_error("End of buffer"));
         }
 
         Ok(&self.buf[start..start + len])
+    }
+
+    /// Read `len` raw bytes from the current position, advancing past them.
+    /// Used for record types whose rdata we carry verbatim (e.g. DNSSEC).
+    pub fn read_bytes(&mut self, len: usize) -> Result<Vec<u8>> {
+        if self.pos + len > self.buf.len() {
+            return Err(dns_error("End of buffer"));
+        }
+
+        let bytes = self.buf[self.pos..self.pos + len].to_vec();
+        self.pos += len;
+
+        Ok(bytes)
     }
 
     pub fn read_u16(&mut self) -> Result<u16> {
@@ -118,7 +137,7 @@ impl BytePacketBuffer {
     }
 
     pub fn write(&mut self, val: u8) -> Result<()> {
-        if self.pos >= DNS_PACKET_SIZE {
+        if self.pos >= self.buf.len() {
             return Err(dns_error("End of buffer"));
         }
 
@@ -130,6 +149,13 @@ impl BytePacketBuffer {
 
     pub fn write_u8(&mut self, val: u8) -> Result<()> {
         self.write(val)
+    }
+
+    pub fn write_bytes(&mut self, bytes: &[u8]) -> Result<()> {
+        for byte in bytes {
+            self.write_u8(*byte)?;
+        }
+        Ok(())
     }
 
     pub fn write_u16(&mut self, val: u16) -> Result<()> {
@@ -173,7 +199,7 @@ impl BytePacketBuffer {
     }
 
     pub fn set(&mut self, pos: usize, val: u8) -> Result<()> {
-        if pos >= DNS_PACKET_SIZE {
+        if pos >= self.buf.len() {
             return Err(dns_error("End of buffer"));
         }
 
